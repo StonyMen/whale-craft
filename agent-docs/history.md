@@ -58,6 +58,8 @@
 | D4 | 离线账户用假 token 做 session join → `ForbiddenOperationException`（2026-09-17 真炸） | 离线模式不该走 session join | `sessionFlags(mode)`：offline 的 `haveCredentials/useAccessToken=false` |
 | D5 | 顶号（同账号另开）连接失败 | `already connected|already logged` | 建连 <9s 时最多重试 4 次 × 3.5s |
 | D6 | yggdrasil 库新旧回调不兼容 → 悬空 rejection | 老式回调调用方 vs 新 async 库 | `wrapYggdrasilServer` 兼容层 + `takeAuthJoinError` 捞错 |
+| D7 | 服务器比插件新（Paper **26.3** + ViaBackwards）时**进服 1 秒必被踢**：客户端 `multiplayer.disconnect.invalid_player_movement`、服务端 `Invalid move player packet received`（2026-11-09 真机，连踢 5 次） | **26.3 的移动校验改成了"按客户端 tick 记账"**：`ServerGamePacketListenerImpl#handleMovePlayer` 里 `if (packet.hasPosition()) { if (this.receivedPositionThisTick) disconnect(invalid_player_movement); this.receivedPositionThisTick = true }`，而这个标志**只在 `handleClientTickEnd`（`serverbound/tick_end`）里复位**。mineflayer 从不发 `tick_end` ⇒ 标志置位后再不复位 ⇒ 整局**第二个**带坐标的移动包必被踢。真 26.1 服务端不从这条路复位，所以"只支持到 26.1"时没人发现；一旦经 ViaBackwards 落到 26.3 后端就爆 | `installClientTick(bot)`：50ms 客户端 tick —— 移动包（`position`/`position_look`/`look`/`flying`）在 tick 内**合并成最多一个**（位置/朝向各取最新，合并成 `position_look`），每拍末尾补 `tick_end`。只在 `client.state==='play'` 后接管；`tick_end` 按版本协议表判存在性、发送失败自动停用；非移动包（含 `teleport_confirm`）**一律立即透传**。实测 40s 连续走跳无踢 |
+| D8 | 服务器版本名带品牌前缀时进服报 `No data available for version 26.3`（2026-11-08 真机） | `version:false` 交给 nmp 的 `autoVersion`：它把 `version.name` 里的 `26.3`（还有协议号）丢给 minecraft-data **猜**，猜到一个我们**没有协议数据**的版本 → 握手包编不出来（`serializer.js:21`），而且这条路径是**异步竞态**（有时猜中 26.1、有时猜 26.3，同一台服两种结果） | `pickHandshakeVersion`：**只信协议号**（`postNettyVersionsByProtocolVersion`），命中且有协议数据才用；没命中但服务器版本比我们支持的最新版新 → 用最新版连（`via-fallback`，这正是 ViaBackwards/ViaVersion 的用法）；其余退回 `false`。`connect()` 里先 `statusPing` 一次定死，日志留一行"握手版本 X（via-fallback；服务器报告 Paper 26.3）" |
 
 ### E. 状态同步系（0.1.7 集中修）
 
@@ -117,6 +119,8 @@
 | `check-core` 抓"私有字段一致性" | 大文件少换行 → V8 提前结束 class → 报误导性错误；`config.mjs` 两行粘连只有动态 import 才炸 |
 | selfcheck 末尾恒 `exit(0)`、几乎不用 assert 库 | 设计成"人可读的 ✅ 清单"；只有 apply() 抛错才红——它定位是**回归护栏 + 文档**，不是严苛测试框架 |
 | 用 monkey-patch 宿主 `Module._resolveFilename`（`src/resolver-shim.mjs`）绕过 DSH rc.2 的 resolver bug | 宿主 `routeScoped` 对**非 link** 插件的 `require('process/')` 会崩，导致 registry 装出的插件整个不加载；bug 在宿主、我们改不了，而 registry 安装是主要分发方式。shim **只在原函数抛该特定 TypeError 时**兜底、其余请求逐字透传；属临时手段，宿主修好后删除（见 F14 与 §4 待办） |
+| **客户端 tick 由插件自己维护**（`installClientTick`：50ms 一拍，移动包合并 + `tick_end` 收尾，2026-11-09） | 26.3 以后"一 tick 一个位置包"是硬校验（D7），而 mineflayer 的 physics 是 20ms 一步、没有 tick 概念。**不能改上游**（铁律：不打包/不打补丁 mineflayer），所以只能在 `client.write` 这一层做**出站整形**：移动包攒到一拍、只发最新的一个，末尾补 `tick_end`。关键约束：① **只碰移动包**——`teleport_confirm`/动作包迟到会被判"没确认传送"；② 只在 `state==='play'` 后接管（握手阶段写 `tick_end` ⇒ 服务端 `Failed to decode packet serverbound/minecraft:hello`，实测踩过）；③ `tick_end` 按协议表判存在、失败自动停用（老版本不认就退回原行为）；④ 必须浅拷贝参数（physics 的 `lastSent` 是原地复用对象） |
+| 握手版本**按协议号定死**，服务器更新时用"我们最新版"连（`pickHandshakeVersion`，2026-11-09） | 依赖 nmp 的 `autoVersion` 有两宗罪：**按名字猜**（`Paper 26.3` → 猜 26.3 → 没协议数据 → `No data available`）与**异步竞态**（20ms 内同一台服可能猜出两个答案）。而"服务端比客户端新"这件事本来就该由服务端（ViaBackwards/ViaVersion）翻译 —— 客户端只要**老实报自己支持的版本**即可。所以：协议号命中且有数据 → 用它；没命中但服务器更新 → 用 `supportedRange().latest`；其余退回 `false`（不改变老行为）。`connect()` 里 ping 一次（≤4s，失败也只是退回自动探测），日志留一行决策依据 |
 
 ## 4. 待办 / 已知边界
 
@@ -125,5 +129,5 @@
 - online 分享模式的 `base` 不做连通性自检（填错只有用户能发现）。
 - `mc_move/mc_act/mc_build` 官方定性"不成熟"（版本硬提示词里让 AI 优先 `mc_command`）。
 - 工具描述与文档目前中文。
-- 能连的 MC 版本取决于依赖里的 mineflayer（想连新版本可自行替换）。
+- 能连的 MC 版本取决于依赖里的 mineflayer（想连新版本可自行替换）。服务端比它新时（26.2/26.3…）靠服务端的 ViaBackwards/ViaVersion 翻译，客户端**报自己能支持的最新版**即可（见 D7/D8）。
 - **🔴 待办（等 DSH 修好 F14 的 resolver bug 后）**：删掉 `src/resolver-shim.mjs` + `index.js` 首条 `import './src/resolver-shim.mjs'`（连同 `src-modules.md` §16b 与本节这条），并记一条 CHANGELOG。判据：**registry（非 link）安装的插件加载 mineflayer 不再 `failed to import`**。

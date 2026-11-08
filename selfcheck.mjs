@@ -3955,6 +3955,70 @@ console.log('\n--- MC 版本范围判定（src/mcversion.mjs）---')
   console.log(`  ${JSON.stringify(parseRelease('1.19')) === '[1,19,0]' && JSON.stringify(parseRelease('26.1')) === '[26,1,0]' ? '✅' : '❌'} parseRelease 缺段补 0（1.19→1.19.0；26.1→26.1.0）`)
 }
 
+console.log('\n--- 26.3 客户端 tick 护栏 + 握手版本决策（src/core.mjs）---')
+{
+  const { installClientTick, pickHandshakeVersion, CLIENT_TICK_MS } = await import('./src/core.mjs')
+  const { EventEmitter } = await import('node:events')
+  const wait = (ms) => new Promise((r) => setTimeout(r, ms))
+
+  // ── ① 握手版本：只信协议号；服务器更新 → 用我们最新的（ViaBackwards 场景）；太老/判不了 → false
+  const fakeData = (v) => (['26.1', '1.21.1'].includes(v) ? { protocol: {} } : null)
+  fakeData.postNettyVersionsByProtocolVersion = { pc: { 775: [{ minecraftVersion: '26.1' }], 767: [{ minecraftVersion: '1.21.1' }], 340: [] } }
+  const pick = (status) => pickHandshakeVersion(status, { oldest: '1.8.8', latest: '26.1', data: fakeData })
+  const pickCases = [
+    [{ name: 'Paper 26.3', protocol: 775 }, '26.1', 'detected'],      // 真机现场：名字 26.3、协议号其实是我们支持的 775
+    [{ name: '1.21.1', protocol: 767 }, '1.21.1', 'detected'],        // 正常命中
+    [{ name: 'Paper 26.4', protocol: 780 }, '26.1', 'via-fallback'],  // 比我们新 + 没数据 → 派最新版，让服务端翻译
+    [{ name: '1.12.2', protocol: 340 }, false, 'unknown'],            // 有元数据但没协议数据 / 太老 → 交回自动探测
+    [{ name: 'weird-server' }, false, 'unknown'],                     // 判不了
+    [{}, false, 'unknown'],                                          // 空状态
+  ]
+  const pickBad = pickCases.filter(([st, v, why]) => { const r = pick(st); return r.version !== v || r.reason !== why })
+  console.log(`  ${pickBad.length === 0 ? '✅' : '❌'} pickHandshakeVersion：协议号优先 / via-fallback / 判不了退回自动（${pickCases.length} 例）${pickBad.length ? '：' + pickBad.map(([st]) => JSON.stringify(st) + '→' + JSON.stringify(pick(st))).join(', ') : ''}`)
+  const picked = pick({ name: 'Paper 26.3', protocol: 775 })
+  console.log(`  ${picked.serverVersion === 'Paper 26.3' && picked.protocol === 775 ? '✅' : '❌'} 决策里带上"服务器自报版本"（排障要看得见：${picked.serverVersion} / 协议 ${picked.protocol}）`)
+
+  // ── ② 客户端 tick 护栏：移动包合并成每 tick 一个 + tick_end 收尾
+  const mkBot = (version, state = 'play') => {
+    const written = []
+    const bot = new EventEmitter()
+    bot.version = version
+    bot._client = { state, write: (name, params) => written.push([name, params ?? null]) }
+    const res = installClientTick(bot)
+    return { bot, written, res }
+  }
+  const oldest = '1.7.10'                                  // 老版本：协议里没有 tick_end（必须自动不装）
+  const a = mkBot(oldest)
+  a.bot._client.write('position', { x: 1, y: 2, z: 3, onGround: true })
+  a.bot._client.write('position_look', { x: 4, y: 5, z: 6, yaw: 1, pitch: 2, onGround: true })
+  a.bot._client.write('look', { yaw: 3, pitch: 4, onGround: true })
+  const chatBefore = a.written.length
+  a.bot._client.write('chat_message', { message: 'hi' })
+  await wait(CLIENT_TICK_MS * 2 + 20)
+  const moves = a.written.filter(([n]) => ['position', 'position_look', 'look', 'flying'].includes(n))
+  const chatIdx = a.written.findIndex(([n]) => n === 'chat_message')
+  console.log(`  ${moves.length === 1 && moves[0][0] === 'position_look' && moves[0][1].x === 4 && moves[0][1].yaw === 3 ? '✅' : '❌'} 一个 tick 内连发 3 个移动包 → 合并成 1 个 position_look（位置取最新、朝向取最新）：${JSON.stringify(moves)}`)
+  console.log(`  ${chatIdx === chatBefore ? '✅' : '❌'} 非移动包**立即透传**，一个包都不许攒（chat_message 在 flush 之前就发出去了）`)
+  console.log(`  ${a.res.tickEnd === false && !a.written.some(([n]) => n === 'tick_end') ? '✅' : '❌'} 协议里没有 tick_end 的老版本 → 不发（tick_end=false）`)
+
+  const { supportedRange } = await import('./src/mcversion.mjs')
+  const tickVer = supportedRange()?.latest ?? null
+  const b = mkBot(tickVer ?? '26.1')
+  b.bot._client.write('position', { x: 1, y: 2, z: 3, onGround: true })
+  await wait(CLIENT_TICK_MS * 2 + 20)
+  const hasTickEnd = b.written.some(([n]) => n === 'tick_end')
+  const tickOk = tickVer && tickVer >= '26.1' ? (b.res.tickEnd === true && hasTickEnd) : b.res.tickEnd === false
+  console.log(`  ${tickOk ? '✅' : '❌'} 支持的版本（${tickVer ?? '?'}）：每个 tick 收尾补一个 tick_end（${b.res.tickEnd ? '已发' : '未发'}）`)
+
+  const c = mkBot(tickVer ?? '26.1', 'handshaking')
+  c.bot._client.write('position', { x: 9, y: 9, z: 9, onGround: true })
+  console.log(`  ${c.written.length === 1 && c.written[0][0] === 'position' ? '✅' : '❌'} 还没进 play（握手/配置阶段）→ 不接管、原样发（踩过：握手阶段写 tick_end ⇒ 服务端解包失败）`)
+
+  const before = b.bot._client.write
+  installClientTick(b.bot)
+  console.log(`  ${b.bot._client.write === before ? '✅' : '❌'} 重复安装不叠包装（避免每次重连多包一层）`)
+}
+
 console.log('\n--- 网页抓取：域名表匹配 + 输出渲染（src/config.mjs hostAllowed / src/webfetch.mjs）---')
 {
   const { hostAllowed } = await import('./src/config.mjs')

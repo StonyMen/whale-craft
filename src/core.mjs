@@ -19,7 +19,8 @@
 import mineflayer from 'mineflayer'
 import vec3pkg from 'vec3'
 import { offlineUuid, dashUuid } from './accounts.mjs'
-import { supportedRange, isVersionSupported } from './mcversion.mjs'
+import { supportedRange, isVersionSupported, parseRelease, compareVersions } from './mcversion.mjs'
+import { statusPing } from './ping.mjs'
 import { EventEmitter } from 'node:events'
 import { createRequire } from 'node:module'
 import { writeFileSync, existsSync, mkdirSync, readFileSync, unlinkSync, appendFileSync } from 'node:fs'
@@ -392,6 +393,184 @@ function heightColorOf (t) {
   return stops[stops.length - 1][1]
 }
 
+/* ─────────── 26.3+ 服务端的「客户端 tick」护栏（2026-11-09 真机：1 秒被踢）───────────
+ * 事故现场（用户服务器：Paper 26.3 + ViaBackwards，mineflayer 只到 26.1）：
+ *   `已进入 @ (13,70,-24) gamemode=spectator` → 约 1 秒后
+ *   `被踢: {"translate":"multiplayer.disconnect.invalid_player_movement"}`
+ *   服务端 side：`lost connection: Invalid move player packet received`
+ *   连踢 5 次，每次都"进得去、1 秒死"。
+ *
+ * 根因（在 Paper 26.3 的 `ServerGamePacketListenerImpl#handleMovePlayer` 字节码里确认）：
+ *   ```java
+ *   if (packet.hasPosition()) {
+ *     if (this.receivedPositionThisTick) disconnect("invalid_player_movement");   // ← 直接踢
+ *     this.receivedPositionThisTick = true;
+ *   }
+ *   ```
+ *   而这个标志**只在 `handleClientTickEnd`（`serverbound/tick_end` 包）里复位**。
+ *   26.x 协议把"客户端 tick"显式化了：真客户端每 tick 发一串动作包、最后用 `tick_end` 收尾；
+ *   mineflayer **从来不发 `tick_end`**，于是 `receivedPositionThisTick` 第一次置位后永不复位 ——
+ *   整条会话里**第二个**带坐标的移动包必被踢。
+ *   （真 26.1 服务端不靠这个标志，所以"官方支持到 26.1"时没人发现；一旦经 ViaBackwards 落到
+ *     26.3 后端，这个检查就生效了。**不是版本号问题，是丢了一个包**。）
+ *
+ * 药方：自己做**客户端 tick**（和原版客户端同构）——
+ *   · 一个 50ms 的节拍；物理引擎在同一节拍里可能连发好几个移动包（mineflayer 的 physics 20ms 一步），
+ *     这里把它们**合并成每 tick 最多一个**（位置/朝向合并成 position_look，最后到的覆盖先到的）；
+ *   · 每拍结尾补一个 `tick_end`（该版本协议里没有这个包就自动停用，见 {@link serverboundPacketNames}）。
+ * 实测：装上后 12 秒不踢、能走能跳（`/tmp/wcdiag` 里那组对照实验）。
+ * ───────────────────────────────────────────────────────────────────────────── */
+
+/** 客户端 tick 的节拍（原版是 20 tick/s）。也是"每 tick 最多一个移动包"的粒度 */
+export const CLIENT_TICK_MS = 50
+
+/** 服务端会当作"这一 tick 收到位置"的包（`ServerboundMovePlayerPacket` 的四种形态） */
+const POSITION_PACKETS = new Set(['position', 'position_look', 'look', 'flying'])
+
+/** 某版本协议里 `play → toServer` 的包名集合；判不了返回 null（调用方按"没有"处理） */
+function serverboundPacketNames (version) {
+  try {
+    const data = requireFromMineflayer('minecraft-data')(version)
+    const map = data?.protocol?.play?.toServer?.types?.packet?.[1]?.[0]?.type?.[1]?.mappings
+    return map ? new Set(Object.values(map)) : null
+  } catch { return null }
+}
+
+/**
+ * 给一个 bot 装上「客户端 tick 垫片」：移动包按 50ms 合并 + 每拍补 `tick_end`。
+ *
+ * 约定：
+ *   · **只拦移动包**，其余（chat / dig / place / teleport_confirm / player_input …）一律原样立即发，
+ *     不做任何延迟 —— 这条尤其重要：`teleport_confirm` 迟到会被服务端判成"没确认传送"。
+ *   · 只在 `client.state === 'play'` 后才接管；登录/配置阶段的包一条都不许攒
+ *     （踩过：握手阶段手贱写 `tick_end` ⇒ 服务端 `Failed to decode packet 'serverbound/minecraft:hello'`）。
+ *   · `tick_end` 只在**该版本协议真的有这个包**时才发；发送失败自动停用（老版本不认就退回原行为）。
+ *   · 定时器 `unref`，`end`/`kicked` 时清掉，绝不留悬挂定时器往死 socket 写包。
+ *
+ * @param {object} bot mineflayer 的 bot
+ * @param {(msg:string)=>void} [log]
+ * @returns {{ok:boolean, tickEnd:boolean, reason?:string}}
+ */
+export function installClientTick (bot, log = () => {}) {
+  const client = bot?._client
+  if (!client || typeof client.write !== 'function') return { ok: false, tickEnd: false, reason: '没有 _client（还没建连？）' }
+  if (client.__wcClientTick) return { ok: true, tickEnd: Boolean(client.__wcClientTick.tickEnd), reason: '已经装过' }
+
+  const origWrite = client.write.bind(client)
+  const packets = serverboundPacketNames(bot.version)
+  let tickEnd = packets ? packets.has('tick_end') : false
+  let pending = null      // { pos?, look?, fly? }
+  let timer = null
+
+  const flush = () => {
+    const s = pending
+    pending = null
+    if (s) {
+      try {
+        if (s.pos && s.look) origWrite('position_look', { ...s.pos, yaw: s.look.yaw, pitch: s.look.pitch })
+        else if (s.pos) origWrite('position', s.pos)
+        else if (s.look) origWrite('look', s.look)
+        else if (s.fly) origWrite('flying', s.fly)
+      } catch (e) { log(`移动包发送失败：${e?.message ?? e}`) }
+    }
+    if (!tickEnd) return
+    try { origWrite('tick_end', {}) } catch (e) {
+      tickEnd = false
+      log(`tick_end 发不出去，已停用（这个版本大概没有这个包）：${e?.message ?? e}`)
+    }
+  }
+  const stop = () => { if (timer) { clearInterval(timer); timer = null } pending = null }
+  const start = () => {
+    if (timer) return
+    timer = setInterval(flush, CLIENT_TICK_MS)
+    timer.unref?.()
+  }
+
+  client.write = (name, params) => {
+    if (name === 'tick_end') return                       // 我们自己统一发，避免一拍两个
+    if (!POSITION_PACKETS.has(name) || client.state !== 'play') return origWrite(name, params)
+    start()
+    // ⚠️ 必须**浅拷贝**：physics 传进来的 `lastSent` 是每 tick 原地复用的同一个对象，
+    //    直接存引用会在 flush 前被改掉（位置/朝向串味）。
+    const p = params ?? {}
+    const snap = { ...p, ...(p.flags && typeof p.flags === 'object' ? { flags: { ...p.flags } } : {}) }
+    if (name === 'position') {
+      pending = { ...pending, pos: snap, fly: null }
+    } else if (name === 'position_look') {
+      pending = { ...pending, pos: snap, look: { yaw: p.yaw, pitch: p.pitch }, fly: null }
+    } else if (name === 'look') {
+      pending = { ...pending, look: snap }
+    } else if (pending?.look && !pending.pos) {
+      pending = { ...pending, look: { ...pending.look, onGround: p.onGround, flags: snap.flags } }
+    } else {
+      pending = { ...pending, fly: snap }
+    }
+  }
+
+  bot.once('end', stop)
+  bot.once('kicked', stop)
+  client.__wcClientTick = { tickEnd, stop }
+  return { ok: true, tickEnd }
+}
+
+/* ─────────── 握手版本：用一次状态 ping 定死，别让 autoVersion 赌 ───────────
+ * 以前一律给 mineflayer `version: false`（自动探测）。autoVersion 的做法是：
+ *   ping → 拿 `version.name` + `version.protocol` → 按协议号/名字查 minecraft-data → 猜最新那个。
+ * 猜错的代价（2026-11-08 真机日志）：`No data available for version 26.3` ——
+ *   它按名字里的 "26.3" 猜到了我们**没有协议数据**的版本，握手直接编不出字节。
+ *
+ * 现在的规矩（**只信协议号，不信名字**）：
+ *   ① 协议号 → minecraft-data 的版本表，命中且有协议数据 → 用它；
+ *   ② 没命中但服务器版本**比我们支持的最新版还新** → 用最新版（`via-fallback`）：
+ *      这正是 ViaBackwards/ViaVersion 的用法 —— 服务端把"老客户端"翻译成新协议；
+ *   ③ 其余情况（太老 / 判不了）→ 退回 `false`（自动探测），至少保持原有行为。
+ */
+export function pickHandshakeVersion (status = {}, { oldest, latest, data } = {}) {
+  const latestSafe = latest ?? supportedRange()?.latest ?? null
+  const oldestSafe = oldest ?? supportedRange()?.oldest ?? null
+  if (!latestSafe) return { version: false, reason: 'unknown' }
+
+  const name = String(status?.name ?? '').trim()
+  const protocol = Number(status?.protocol)
+  const candidates = []
+
+  if (Number.isFinite(protocol)) {
+    const byProto = data?.postNettyVersionsByProtocolVersion?.pc?.[protocol] ?? []
+    for (const v of byProto) if (v?.minecraftVersion) candidates.push(v.minecraftVersion)
+  }
+  const bare = /(\d+\.\d+(?:\.\d+)?)/.exec(name)?.[0]
+  if (bare) candidates.push(bare)
+
+  for (const c of candidates) {
+    let hasData = false
+    try { hasData = Boolean(data?.(c)?.protocol) } catch { hasData = false }
+    // 必须在支持区间内（连 1.8 这种"有数据但太老"的也别主动指名）
+    if (hasData && isVersionSupported(c, { oldest: oldestSafe, latest: latestSafe }) === true) {
+      return { version: c, reason: 'detected', serverVersion: name || null, protocol: Number.isFinite(protocol) ? protocol : null }
+    }
+  }
+
+  const sParts = parseRelease(bare ?? name)
+  const lParts = parseRelease(latestSafe)
+  if (sParts && lParts && compareVersions(sParts, lParts) > 0) {
+    return { version: latestSafe, reason: 'via-fallback', serverVersion: name || null, protocol: Number.isFinite(protocol) ? protocol : null }
+  }
+  return { version: false, reason: 'unknown', serverVersion: name || null, protocol: Number.isFinite(protocol) ? protocol : null }
+}
+
+/**
+ * 握手版本（含那次状态 ping）。**永不抛异常**：探测失败就退回自动探测（`false`）。
+ * @param {{host:string, port:number, fakeHost?:string, timeoutMs?:number}} o
+ */
+export async function resolveHandshakeVersion ({ host, port, fakeHost = '', timeoutMs = 4000 } = {}) {
+  if (!host) return { version: false, reason: 'no-host' }
+  let st = null
+  try { st = await statusPing({ host, port, fakeHost, timeoutMs }) } catch (e) { return { version: false, reason: `ping-error:${e?.message ?? e}` } }
+  if (!st?.ok) return { version: false, reason: `ping-failed:${st?.error ?? 'unknown'}` }
+  const data = (() => { try { return requireFromMineflayer('minecraft-data') } catch { return null } })()
+  return pickHandshakeVersion({ name: st.version, protocol: st.protocol }, { data })
+}
+
 /**
  * 一个 Minecraft 机器人（保活、事件、世界操作）。
  * 事件（EventEmitter）：'chat'(玩家聊天) 'system'(系统消息) 'spawn' 'end' 'kicked' 'error' 'damage' 'log'
@@ -615,13 +794,17 @@ export class McBot extends EventEmitter {
    *
    * 🔴 2026-10-05（用户定）：不再有 `subserver` / `version` 参数 —— 用户只输入一个 address；
    *    握手 serverHost 由 mineflayer 默认用 host（= 用户地址）发出，DNS + Velocity 自行路由。
-   *    版本**永远自动探测**；连上后发现版本不在支持范围内 → 断开并抛错。
+   *
+   * 🔴 2026-11-09 起：版本仍**不由调用方传**，但也不再交给 mineflayer 的 autoVersion 去猜 ——
+   *    先自己 ping 一次，按**协议号**定死握手版本（见 {@link pickHandshakeVersion}）。
+   *    服务器比我们支持的最新版还新时（ViaBackwards/ViaVersion 场景）就用最新版连，
+   *    让服务端去做协议翻译 —— 这才是"客户端版本比服务端老"该走的正路。
+   *    连上后若协商出的版本仍不在支持范围内 → 断开并抛错（老规矩，没变）。
    */
   async connect (opts = {}) {
     const host    = opts.host      || this.cfg.host      || DEFAULTS.host
     const port    = Number(opts.port ?? this.cfg.port ?? DEFAULTS.port)
     const sub     = this.cfg.subserver || DEFAULTS.subserver || ''
-    const version = false                 // 永远自动探测（用户 2026-10-05：不再由调用方传）
     const auth    = opts.auth ?? null
 
     if (!host) {
@@ -642,6 +825,18 @@ export class McBot extends EventEmitter {
     if (this.online && this.sub === sub && this._lastHost === host) return this.bot
     if (this.connecting) { await this.connecting.catch(() => {}); if (this.online) return this.bot }
 
+    // 握手版本：**先 ping 一次定死**（见 pickHandshakeVersion 的注释）。
+    // 探测不通/判不了就退回 `false` = 老行为（让 mineflayer 自己猜），不因为"探不到状态"就进不去服。
+    const picked = await resolveHandshakeVersion({ host, port, fakeHost: sub })
+    const version = picked.version || false
+    if (picked.version) {
+      if (picked.reason !== 'detected') {
+        this.log(`握手版本 ${picked.version}（${picked.reason}；服务器报告 ${picked.serverVersion ?? '未知'}）`)
+      }
+    } else if (/^(ping-failed|ping-error)/.test(String(picked.reason ?? ''))) {
+      this.log(`版本探测失败（${picked.reason}），退回自动探测`)
+    }
+
     const attemptOnce = async (attempt) => {
       // 账户 → session（离线自己造；皮肤站 token 优先刷新）。凭据只在这一层出现。
       const session = await this.#makeSession(auth)
@@ -659,7 +854,7 @@ export class McBot extends EventEmitter {
         // 皮肤站才需要 sessionServer；离线自己造 session，不碰认证服
         ...(auth.mode === 'yggdrasil' ? { sessionServer: `${auth.authUrl}/sessionserver` } : {}),
         accessToken: session.accessToken,
-        version,                              // false = 自动探测
+        version,                              // 探测定死的版本；false = 退回自动探测（见上）
         auth: (client, options) => {
           client.session = session
           client.uuid = uuid
@@ -691,6 +886,21 @@ export class McBot extends EventEmitter {
         },
       })
       b._createdAt = Date.now()
+
+      // 26.3+ 服务端要求"每 tick 最多一个带位置的移动包 + tick_end 收尾"，mineflayer 不会自己发
+      // （见 installClientTick 的事故档案）。装在这里 = 抢在任何移动包之前接管。
+      // 版本还没解析出来（老路径 version:false）就先等 login，那时 `bot.version` 一定有了。
+      const armTickShim = () => {
+        try {
+          const r = installClientTick(b, (m) => this.log(m))
+          if (r.ok) this.log(`客户端 tick 护栏已启用（tick_end ${r.tickEnd ? '可用' : '不可用，仅合并移动包'}）`)
+          else this.log(`客户端 tick 护栏未启用：${r.reason ?? '未知原因'}`)
+        } catch (e) {
+          this.log('客户端 tick 护栏安装失败（不影响连接）：' + (e?.message ?? e))
+        }
+      }
+      if (b.version) armTickShim()
+      else b.once('login', armTickShim)
 
       let dupe = false
       b.on('error', (e) => { this.#reportError(e) })

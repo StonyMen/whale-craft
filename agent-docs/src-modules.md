@@ -7,7 +7,7 @@
 
 ## 1. `src/core.mjs` —— McBot（mineflayer 封装，不依赖 DSH）
 
-**导出**：`McBot`（default 也是它）、`Vec3`、`DEFAULTS`、`TIMEOUTS`、`DEFAULT_COMMAND_WHITELIST`、`withTimeout`、`raceAbort`、`lossless`、`glyphOf`、`logLine`、`libraryInfo`、`sessionFlags`、`takeAuthJoinError`、`wrapYggdrasilServer`、`friendlyAuthError`。
+**导出**：`McBot`（default 也是它）、`Vec3`、`DEFAULTS`、`TIMEOUTS`、`DEFAULT_COMMAND_WHITELIST`、`withTimeout`、`raceAbort`、`lossless`、`glyphOf`、`logLine`、`libraryInfo`、`sessionFlags`、`takeAuthJoinError`、`wrapYggdrasilServer`、`friendlyAuthError`、`installClientTick`、`CLIENT_TICK_MS`、`pickHandshakeVersion`、`resolveHandshakeVersion`。
 
 ### 工具函数
 
@@ -18,12 +18,15 @@
 - `libraryInfo()`：报 mineflayer 版本 / testedVersions / minecraft-data 版本，不连服。
 - `sessionFlags(mode)`：离线账户 `haveCredentials/useAccessToken=false`（假 token 做 session join 会 `ForbiddenOperationException`，真炸过）；yggdrasil=true。
 - `wrapYggdrasilServer` / `takeAuthJoinError` / `friendlyAuthError`：yggdrasil 库新旧回调兼容层 + 认证错误转"可执行的人话"（`needUserAction:true`）。
+- `installClientTick(bot, log?)`（2026-11-09）：**客户端 tick 垫片** —— 拦 `client.write`，把移动包（`position`/`position_look`/`look`/`flying`）按 `CLIENT_TICK_MS`(50ms) 合并成**每 tick 最多一个**，每拍末尾补 `tick_end`。26.3 服务端的 `receivedPositionThisTick` 只在收到 `tick_end` 时复位，mineflayer 从不发 ⇒ 第二个移动包必被踢（见 [history.md](history.md) D7）。约束：只在 `state==='play'` 后接管；非移动包一律立即透传；`tick_end` 按协议表判存在、失败自动停用；参数必须浅拷贝（physics 的 `lastSent` 是原地复用对象）；`end`/`kicked` 时停表。返回 `{ok, tickEnd, reason?}`，重复调用幂等。
+- `pickHandshakeVersion(status, {oldest, latest, data})`（2026-11-09）：**纯函数**，握手版本决策 —— 协议号命中且有协议数据 → 用它；没命中但服务器版本比 `latest` 新 → 返回 `latest`（`reason:'via-fallback'`，交给服务端 ViaBackwards 翻译）；其余 `{version:false}`（退回 mineflayer 自动探测）。只信协议号，不信版本名（`Paper 26.3` 这种名字会把人带沟里，见 D8）。
+- `resolveHandshakeVersion({host, port, fakeHost, timeoutMs})`：`statusPing` 一次 + 上面那个纯函数。**永不抛**（探测失败就 `false`）。
 
 ### McBot 类
 
 - 构造：`{...config, instanceId}`；字段含 `bot/sub/connecting/connectedAt/lastError/autoReconnect/reconnectDelay/reconnecting/reconnectPending/chat/stopped/lastTimeout/abortSignal/stats{connects,deaths,chats,lastEventAt,timeouts}`。
 - **`online` getter** = `bot.entity 存在 && _client.ended !== true` —— 幽灵在线的判据（见下）。
-- `connect(opts)`：参数 `{host, port, auth, onAuth}`；`auth` 是**唯一凭据入口**（`{mode:'offline'|'yggdrasil', username, password?, server?...}`），绝不出现在任何返回值。2026-10-05：`subserver`/`version` 已删（版本永远自动探测；连上后不在支持范围则断开抛错）。细节：
+- `connect(opts)`：参数 `{host, port, auth, onAuth}`；`auth` 是**唯一凭据入口**（`{mode:'offline'|'yggdrasil', username, password?, server?...}`），绝不出现在任何返回值。2026-10-05：`subserver`/`version` 参数已删（**不由调用方传**）；2026-11-09 起版本改为"先 ping 一次、按协议号定死"（`resolveHandshakeVersion`），连上后协商版本仍不在支持范围则断开抛错。细节：
   - 已在线且同 sub+host → 直接返回；并发 connecting → 等同一个 promise；
   - 顶号（`already connected|already logged` 且建连 <9s）最多重试 4 次 × 3.5s；失败**保留原连接**；
   - yggdrasil 才设 `sessionServer`；`fakeHost: sub` 过 HAProxy 子服路由；等 spawn 超时 `connectTimeoutMs`（45s）。

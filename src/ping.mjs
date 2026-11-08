@@ -45,7 +45,7 @@ export function friendlyNetError (e) {
     CERT_HAS_EXPIRED: 'TLS 证书过期',       // 一般 MC 用不到，留着兜底
   }
   if (table[code]) return `${code}：${table[code]}`
-  if (/unsupported protocol/i.test(msg)) return '服务端上报的协议号不在本地版本表里（服务端太新/太老，考虑用 mc_connect 的 version 参数手填版本）'
+  if (/unsupported protocol/i.test(msg)) return '服务端上报的协议号不在本地版本表里（服务端比依赖里的 mineflayer 还新，或太老）'
   if (code) return `${code}：${msg}`
   return msg || '未知错误'
 }
