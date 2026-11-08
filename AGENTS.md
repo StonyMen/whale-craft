@@ -54,7 +54,8 @@ npm run check                 # = check-core + selfcheck
 | `src/*.mjs` | 协作模块（core = mineflayer 封装，**不依赖 DSH**，可独立测试） |
 | `presets/*.patch.yml` | 「MC模式」「MC+模式」两个 preset 的声明式定义 |
 | `selfcheck.mjs` | 600+ 条离线断言：假 ctx 加载**真** `apply()`，不连 MC |
-| `tools/` | `check-core.mjs`（静态检查）、`dev.mjs`（隔离调试实例） |
+| `tools/` | `check-core.mjs`（静态检查）、`check-mcp.mjs`（转接头协议自检）、`dev.mjs`（隔离调试实例） |
+| `mcp/` | WorkBuddy 转接头：`host-shim.mjs`（最小假宿主跑 `apply()`）+ `server.mjs`（MCP stdio）。**不改插件代码**，暴露 24 个游戏内工具（见 `mcp/README.md`） |
 | `extensions/` | 扩展点：丢一个 `.mjs` 进目录即自动加载（契约见 `extensions/README.md`） |
 
 详细代码地图见 `agent-docs/README.md`。

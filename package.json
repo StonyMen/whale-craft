@@ -36,6 +36,7 @@
   "files": [
     "index.js",
     "client.js",
+    "mcp",
     "selfcheck.mjs",
     "cordis.patch.yml",
     "presets",
@@ -86,7 +87,9 @@
     "registry": "https://registry.npmjs.org/"
   },
   "scripts": {
-    "check": "node tools/check-core.mjs && node selfcheck.mjs",
+    "check": "node tools/check-core.mjs && node selfcheck.mjs && node tools/check-mcp.mjs",
+    "check:mcp": "node tools/check-mcp.mjs",
+    "mcp": "node mcp/server.mjs",
     "dev:web": "node tools/dev.mjs web",
     "dev:desktop": "node tools/dev.mjs desktop",
     "dev:link": "node tools/dev.mjs link",

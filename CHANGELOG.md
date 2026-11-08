@@ -7,6 +7,7 @@
 
 ## [未发布]
 
+- 【新增】**WorkBuddy 转接头（MCP）**：`mcp/server.mjs` + `mcp/host-shim.mjs`。用一个最小假宿主跑插件的 `apply()`，把工具按 MCP（stdio）暴露出去，**不需要安装 DSH**，也不依赖 `@deepseek-ai/*`。默认暴露 24 个纯游戏内工具（连接 / 感知 / 行动 / 信息），隐藏 8 个依赖 DSH 宿主设施的工具（看门狗、`mc_stop`、网页分享、管理调试）。已知差别：**没有主动唤醒**（只能被动调用）、没有 MC/MC+ 模式与设置界面。用法见 [`mcp/README.md`](mcp/README.md)，协议自检 `npm run check:mcp`
 - 【修复】**服务器比插件支持的版本新（如 26.2 / 26.3 + ViaBackwards）时，进服 1 秒就被踢**（服务端日志 `Invalid move player packet received`，客户端 `multiplayer.disconnect.invalid_player_movement`）。根因是 26.3 服务端要求客户端"每个 tick 最多上报一次位置、并用 `tick_end` 收尾"，而底层 mineflayer 从不发这个包 —— 于是整局只有第一个移动包合法，第二个必被判定为非法移动。现在插件自己维护客户端 tick：一个 tick 内连发的移动包会合并成一个，末尾补 `tick_end`
 - 【修复】服务器版本名带品牌前缀（如 `Paper 26.3`）时，进服直接报 `No data available for version 26.3`。现在握手版本改为**按协议号**确定，不再按名字猜；服务器比插件支持的最新版更新时，用最新版去连、交给服务端（ViaBackwards / ViaVersion）做协议翻译 —— 这条路走通的前提是"客户端老老实实报自己支持的版本"
 

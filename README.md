@@ -146,6 +146,15 @@ CI 跑的就是这两条（`.github/workflows/ci.yml`）：**ubuntu（Node 22 / 
 
 ---
 
+## 在 WorkBuddy / 其他 MCP 客户端里用（转接头）
+
+不想装 DSH、或者想用别的 MCP 客户端？仓库自带一层**转接头**：用最小假宿主把插件的 `apply()` 跑起来，
+再把工具按 **MCP（stdio）** 暴露出去 —— **不需要安装 DSH，也不依赖 `@deepseek-ai/*`**（它们是 optional peer，插件内有内置兜底）。
+
+- 默认暴露 **24 个纯游戏内工具**（连接 / 感知 / 行动 / 信息），隐藏 8 个依赖 DSH 宿主设施的工具（看门狗、`mc_stop`、网页分享、管理调试）
+- 差别：**没有主动唤醒**（看门狗不会叫醒模型，只能被动调用）、没有 MC/MC+ 模式与设置界面；token 上通常更省
+- 启用步骤、环境变量与排错见 [`mcp/README.md`](mcp/README.md)；协议自检 `npm run check:mcp`
+
 ## 已知限制
 
 - **微软正版登录未实现**（只有离线 / Yggdrasil 皮肤站）。
